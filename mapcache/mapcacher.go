@@ -21,12 +21,10 @@ type singleton struct {
 	mu     sync.RWMutex
 }
 
-//holds time to live for cache item
-const ttlInSecond = 30
-
 var (
-	instance *singleton //single instance of the cache
-	once     sync.Once
+	ttlInSecond = 30       //holds time to live for cache item
+	instance    *singleton //single instance of the cache
+	once        sync.Once
 )
 
 //Mapcacher interface wrapper for singletone struct
@@ -48,13 +46,13 @@ func GetInstance() Mapcacher {
 	return instance
 }
 
-//Set method sets cache item
+//Set method sets cache item (!possible to set an item with empty key)
 func (s *singleton) Set(key string, value interface{}) {
+	//produce new context from the background one with timeout and a cancel func
+	ctxWithTimeout, cFunc := context.WithTimeout(s.ctxBck, getTimeDurationFunc(ttlInSecond))
+
 	//cache write lock
 	s.mu.Lock()
-
-	//produce new context froma the background one with timeout and cancel func
-	ctxWithTimeout, cFunc := context.WithTimeout(s.ctxBck, getTimeDurationFunc(ttlInSecond))
 
 	//set cache item with context.CancelFunc attached
 	s.cache[key] = &item{
@@ -62,26 +60,28 @@ func (s *singleton) Set(key string, value interface{}) {
 		data:   value,
 	}
 
-	//start locked func awaited for TTL to be reached
-	go lockAndDelete(ctxWithTimeout, key)
-
 	//cache write ulock
-	s.mu.Unlock() //explicit call instead of defer call because of an execution overhead
+	s.mu.Unlock() //explicit call instead of defer call because of a defer execution overhead
+
+	//start channel locked func awaited for timeout or cancel call
+	go lockAndDelete(ctxWithTimeout, key)
 }
 
 //Get method reads item from cache and then remove it
-func (s *singleton) Get(key string) (item interface{}, itemExist bool) {
+func (s *singleton) Get(key string) (interface{}, bool) {
 	s.mu.RLock()
-	item, itemExist = s.cache[key]
+	item, ok := s.cache[key]
 	s.mu.RUnlock()
 
-	if itemExist {
-		s.Delete(key)
+	if ok {
+		item.cancel()
+		return item.data, ok
 	}
-	return
+
+	return nil, ok
 }
 
-//Delete method removes item from cache
+//Delete method removes item from the cache
 func (s *singleton) Delete(key string) {
 	s.mu.Lock()
 	delete(s.cache, key)
@@ -91,15 +91,13 @@ func (s *singleton) Delete(key string) {
 //lockAndDelete func to be spawned locked during Set() execution
 func lockAndDelete(ctx context.Context, key string) {
 
-	//lock reading from the ctx.Done() channel
+	//lock while reading from the ctx.Done() channel
 	<-ctx.Done()
-
 	switch ctx.Err() {
-	case context.DeadlineExceeded: //context's timeout reached, cache item to be removed
+	case context.DeadlineExceeded:
 		i := GetInstance()
 		i.Delete(key)
-	default: //context cancelled for other reason - exiting func
-		return
+	default:
 	}
 
 }
